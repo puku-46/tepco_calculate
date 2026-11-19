@@ -1,0 +1,6 @@
+data/
+*.xlsx
+*.csv
+!sample_data/*.csv
+.streamlit/secrets.toml
+__pycache__/
