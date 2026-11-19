@@ -105,3 +105,10 @@ def billing_period(year: int, month: int, start_day: int = 27):
         return date(year, month, 1), nxt - timedelta(days=1)
     py, pm = (year - 1, 12) if month == 1 else (year, month - 1)
     return date(py, pm, start_day), date(year, month, start_day - 1)
+
+
+def billing_month(d, start_day: int = 27):
+    """日付が属する検針月(年, 月)。start_day=27 なら 27日以降は翌月分、1 なら暦月。"""
+    if start_day <= 1 or d.day < start_day:
+        return d.year, d.month
+    return (d.year + 1, 1) if d.month == 12 else (d.year, d.month + 1)
