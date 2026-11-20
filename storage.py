@@ -23,6 +23,14 @@ def _clean(v):
     return v
 
 
+def _s(v) -> str:
+    """CSVに書く文字列にする(1234.0 → 1234)。"""
+    v = _clean(v)
+    if isinstance(v, float) and v.is_integer():
+        return str(int(v))
+    return str(v)
+
+
 def _norm_date(x) -> str:
     d = pd.to_datetime(str(x).strip(), format="mixed", errors="coerce")
     return "" if pd.isna(d) else d.strftime("%Y-%m-%d")
@@ -54,7 +62,7 @@ class CsvStore:
 
     def upsert_daily(self, rec: dict) -> str:
         df = self.read("daily")
-        row = {c: _clean(rec.get(c)) for c in DAILY_COLS}
+        row = {c: _s(rec.get(c)) for c in DAILY_COLS}
         target = _norm_date(row["date"])
         hit = (df["site"].astype(str).str.strip() == rec["site"]) & (
             pd.to_datetime(df["date"], format="mixed", errors="coerce").dt.strftime("%Y-%m-%d") == target)
@@ -68,6 +76,27 @@ class CsvStore:
         os.makedirs(self.folder, exist_ok=True)
         df.to_csv(self._path("daily"), index=False, encoding="utf-8-sig")
         return result
+
+
+    def upsert_daily_many(self, recs: list) -> tuple:
+        """複数日分をまとめて保存する。(追加数, 更新数)を返す。"""
+        df = self.read("daily")
+        norm = pd.to_datetime(df["date"], format="mixed", errors="coerce").dt.strftime("%Y-%m-%d") if len(df) else pd.Series(dtype=str)
+        added = updated = 0
+        for rec in recs:
+            row = {c: _s(rec.get(c)) for c in DAILY_COLS}
+            hit = (df["site"].astype(str).str.strip() == rec["site"]) & (norm == _norm_date(row["date"])) if len(df) else pd.Series(dtype=bool)
+            if len(df) and hit.any():
+                for c, v in row.items():
+                    df.loc[hit, c] = v
+                updated += 1
+            else:
+                df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
+                norm = pd.concat([norm, pd.Series([_norm_date(row["date"])])], ignore_index=True)
+                added += 1
+        os.makedirs(self.folder, exist_ok=True)
+        df.to_csv(self._path("daily"), index=False, encoding="utf-8-sig")
+        return added, updated
 
 
 class SheetsStore:
@@ -106,6 +135,34 @@ class SheetsStore:
                 return "updated"
         ws.append_row(row, value_input_option="RAW")
         return "added"
+
+
+    def upsert_daily_many(self, recs: list) -> tuple:
+        """複数日分をまとめて保存する(読み取り1回、更新は1回のbatch、追加は1回)。(追加数, 更新数)を返す。"""
+        ws = self.sh.worksheet("daily")
+        values = ws.get_all_values()
+        if not values:
+            ws.append_row(DAILY_COLS, value_input_option="RAW")
+            values = [DAILY_COLS]
+        header = values[0]
+        i_site, i_date = header.index("site"), header.index("date")
+        index = {}
+        for n, r in enumerate(values[1:], start=2):
+            if len(r) > max(i_site, i_date):
+                index[(r[i_site].strip(), _norm_date(r[i_date]))] = n
+        updates, appends = [], []
+        for rec in recs:
+            row = [_clean(rec.get(c)) for c in header]
+            n = index.get((rec["site"], _norm_date(rec["date"])))
+            if n:
+                updates.append({"range": f"A{n}:{_col_letter(len(header))}{n}", "values": [row]})
+            else:
+                appends.append(row)
+        if updates:
+            ws.batch_update(updates, value_input_option="RAW")
+        if appends:
+            ws.append_rows(appends, value_input_option="RAW")
+        return len(appends), len(updates)
 
 
 def make_store(info, spreadsheet_id, sample_dir: str = "sample_data"):
