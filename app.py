@@ -75,7 +75,7 @@ def yen(x):
 
 
 st.title("⚡ 電気代")
-tab_in, tab_view, tab_bill, tab_csv = st.tabs(["入力", "閲覧", "料金", "CSV"])
+tab_in, tab_imp, tab_view, tab_bill, tab_csv = st.tabs(["入力", "取込", "閲覧", "料金", "CSV"])
 
 # ---------- 入力 ----------
 with tab_in:
@@ -137,6 +137,47 @@ with tab_in:
                                         "noon": "昼", "evening": "晩", "night": "夜"})
         cols = ["日付", "全体"] + (["新棟"] if has_new else []) + ["朝", "昼", "晩", "夜"]
         st.dataframe(recent[cols], hide_index=True)
+
+# ---------- 取込(収集プログラムの出力) ----------
+with tab_imp:
+    st.caption("収集プログラムが作ったExcelを選ぶと、朝・昼・晩・夜を日ごとに取り込みます。複数日分をまとめて取り込めます。")
+    up = st.file_uploader("収集プログラムのExcel(.xlsx)", type=["xlsx"], key="imp_file")
+    today = date.today()
+    ci1, ci2 = st.columns(2)
+    imp_year = int(ci1.number_input("年", min_value=2020, max_value=2100, value=today.year, step=1, key="imp_y"))
+    imp_month = int(ci2.number_input("月", min_value=1, max_value=12, value=today.month, step=1, key="imp_m"))
+    st.caption("ファイルには日(1〜31)しか入っていないので、何年何月分かをここで指定します。")
+    upd_total = st.checkbox("登録済みの日の「全体」も、朝〜夜の合計で更新する", value=False, key="imp_total")
+    if up is not None:
+        try:
+            new_rows, warns = an.parse_collector_xlsx(up, imp_year, imp_month, sites)
+        except Exception as e:  # 壊れたファイルなど
+            st.error(f"ファイルを読み取れませんでした: {e}")
+            new_rows, warns = None, []
+        for w in warns:
+            st.warning(w)
+        if new_rows is not None and new_rows.empty:
+            st.info("取り込める日がありませんでした。")
+        elif new_rows is not None:
+            plan = an.plan_import(daily, new_rows, today, update_total=upd_total)
+            n_new = int((plan["status"] == "新規").sum())
+            n_upd = int((plan["status"] == "更新").sum())
+            n_same = int((plan["status"] == "同じ").sum())
+            st.markdown(f"**新規 {n_new}日 / 更新 {n_upd}日 / 変更なし {n_same}日**")
+            view = plan.copy()
+            view["date"] = view["date"].dt.strftime("%m/%d")
+            view = view.rename(columns={"status": "状態", "site": "拠点", "date": "日付", "total_kwh": "全体",
+                                        "morning": "朝", "noon": "昼", "evening": "晩", "night": "夜", "note": "備考"})
+            st.dataframe(view[["状態", "拠点", "日付", "全体", "朝", "昼", "晩", "夜", "備考"]], hide_index=True)
+            miss = an.missing_days(daily, plan, site_names, imp_year, imp_month, today)
+            if miss:
+                st.warning("まだ入っていない日: " + " / ".join(f"{s} {', '.join(r)}" for s, r in miss.items()))
+            recs = an.plan_records(plan)
+            if st.button(f"この内容を保存({len(recs)}日分)", type="primary", disabled=not recs, key="imp_save"):
+                added, updated = get_store().upsert_daily_many(recs)
+                st.cache_data.clear()
+                st.success(f"保存しました(新規 {added}日、更新 {updated}日)。")
+                daily, params, sites = load_all()
 
 # ---------- 閲覧 ----------
 with tab_view:
