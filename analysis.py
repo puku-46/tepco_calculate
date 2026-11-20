@@ -12,7 +12,7 @@ DAILY_COLS = ["site", "date"] + DAILY_NUM + ["source"]
 PARAM_NUM = ["contract_kw", "base_unit", "power_factor", "unit_price", "fuel_adj", "renewable",
              "annual_discount", "fixed_credit", "price_morning", "price_noon", "price_evening", "price_night"]
 PARAM_COLS = ["site", "month"] + PARAM_NUM
-SITE_COLS = ["site", "start_day", "has_new_bldg"]
+SITE_COLS = ["site", "start_day", "has_new_bldg", "source_name"]
 
 
 def _num(s: pd.Series) -> pd.Series:
@@ -59,6 +59,7 @@ def normalize_sites(df: pd.DataFrame) -> pd.DataFrame:
     df["start_day"] = _num(df["start_day"]).fillna(27).astype(int)
     flag = df["has_new_bldg"].astype("string").str.strip().str.lower()
     df["has_new_bldg"] = flag.isin(["true", "1", "yes", "y", "はい", "○"])
+    df["source_name"] = df["source_name"].astype("string").str.strip().fillna(df["site"])
     return df[SITE_COLS].reset_index(drop=True)
 
 
@@ -159,3 +160,123 @@ def monthly_table(daily, params, sites, site_names, d_from, d_to) -> pd.DataFram
             r["備考"] = " / ".join(s["notes"])
             rows.append(r)
     return pd.DataFrame(rows)
+
+
+# ---------- 収集プログラムの出力(Excel)の取り込み ----------
+COLLECTOR_ROWS = {"morningKwh": "morning", "noonKwh": "noon", "eveningKwh": "evening", "nightKwh": "night"}
+
+
+def parse_collector_xlsx(file, year: int, month: int, sites: pd.DataFrame):
+    """収集プログラムのExcel(拠点ごとのシート、1行目=日、A列=morningKwh等)を読む。
+    ファイルに年月は入っていないので、year/month は呼び出し側で指定する。"""
+    from datetime import date
+    from openpyxl import load_workbook
+    wb = load_workbook(file, data_only=True)
+    src = {str(r.source_name): r.site for r in sites.itertuples()}
+    rows, warns, seen = [], [], set()
+    for ws in wb.worksheets:
+        site = src.get(ws.title.strip())
+        if site is None:
+            warns.append(f"シート「{ws.title}」に対応する拠点がありません(sitesタブのsource_nameを確認してください)。")
+            continue
+        seen.add(site)
+        labels = {}
+        for r in range(1, ws.max_row + 1):
+            lab = ws.cell(r, 1).value
+            if isinstance(lab, str) and lab.strip() in COLLECTOR_ROWS:
+                labels[COLLECTOR_ROWS[lab.strip()]] = r
+        if len(labels) < 4:
+            warns.append(f"シート「{ws.title}」に朝・昼・晩・夜の行がそろっていません。")
+            continue
+        for c in range(2, ws.max_column + 1):
+            try:
+                d = date(year, month, int(ws.cell(1, c).value))
+            except (TypeError, ValueError):
+                continue
+            vals = {k: ws.cell(r, c).value for k, r in labels.items()}
+            if any(isinstance(v, bool) or not isinstance(v, (int, float)) for v in vals.values()):
+                warns.append(f"{site} {d.month}/{d.day}: 値が空か数値でないため取り込みません。")
+                continue
+            rows.append({"site": site, "date": pd.Timestamp(d), **{k: float(v) for k, v in vals.items()}})
+    for s in sites["site"]:
+        if s not in seen:
+            warns.append(f"{s}のシートがファイルにありません。")
+    return pd.DataFrame(rows, columns=["site", "date"] + BAND_COLS), warns
+
+
+def plan_import(daily: pd.DataFrame, new: pd.DataFrame, today, update_total: bool = False) -> pd.DataFrame:
+    """取り込み内容と、既存データとの比較(新規/更新/同じ)を作る。
+    全体kWh: 既存の行があればそのまま残す(update_total=Trueなら朝〜夜の合計で更新)。新規の日は朝〜夜の合計。"""
+    ex = daily.set_index(["site", "date"]) if not daily.empty else None
+    out = []
+    for r in new.itertuples(index=False):
+        d = r.date.date()
+        if d > today:
+            continue                                   # 未来の日付は取り込まない
+        bands = [float(getattr(r, c)) for c in BAND_COLS]
+        bsum = sum(bands)
+        notes, new_bldg = [], float("nan")
+        e = ex.loc[(r.site, r.date)] if ex is not None and (r.site, r.date) in ex.index else None
+        if e is None:
+            status, total = "新規", bsum
+        else:
+            old = [e[c] for c in BAND_COLS]
+            same = all(pd.notna(o) and o == b for o, b in zip(old, bands))
+            total = bsum if update_total else (float(e["total_kwh"]) if pd.notna(e["total_kwh"]) else bsum)
+            new_bldg = e["new_bldg_kwh"]
+            status = "同じ" if same and (not update_total or total == e["total_kwh"]) else "更新"
+            if not same:
+                diffs = [f"{n} {o:,.0f}→{b:,.0f}" if pd.notna(o) else f"{n} 未入力→{b:,.0f}"
+                         for n, o, b in zip(BAND_JA, old, bands) if not (pd.notna(o) and o == b)]
+                notes.append("既存と違う区分: " + "、".join(diffs))
+        if total > 0 and abs(total - bsum) > total * 0.02:
+            notes.append(f"全体({total:,.0f})と朝〜夜の合計({bsum:,.0f})の差が大きい")
+        if d == today:
+            notes.append("今日の分です。1日の途中の値かもしれません")
+        out.append({"status": status, "site": r.site, "date": r.date, "total_kwh": total, "new_bldg_kwh": new_bldg,
+                    **dict(zip(BAND_COLS, bands)), "note": " / ".join(notes)})
+    cols = ["status", "site", "date", "total_kwh", "new_bldg_kwh"] + BAND_COLS + ["note"]
+    return pd.DataFrame(out, columns=cols).sort_values(["site", "date"]).reset_index(drop=True)
+
+
+def plan_records(plan: pd.DataFrame) -> list:
+    """保存する行(「同じ」は除く)を、upsert用の辞書にする。"""
+    recs = []
+    for r in plan[plan["status"] != "同じ"].itertuples(index=False):
+        recs.append({"site": r.site, "date": r.date.date().isoformat(), "total_kwh": r.total_kwh,
+                     "new_bldg_kwh": None if pd.isna(r.new_bldg_kwh) else r.new_bldg_kwh,
+                     **{c: getattr(r, c) for c in BAND_COLS}, "source": "actual"})
+    return recs
+
+
+def date_ranges(dates) -> list:
+    ds = sorted(set(dates))
+    out, i = [], 0
+    while i < len(ds):
+        j = i
+        while j + 1 < len(ds) and (ds[j + 1] - ds[j]).days == 1:
+            j += 1
+        a, b = ds[i], ds[j]
+        out.append(f"{a.month}/{a.day}" if i == j else f"{a.month}/{a.day}〜{b.month}/{b.day}")
+        i = j + 1
+    return out
+
+
+def missing_days(daily: pd.DataFrame, plan: pd.DataFrame, site_names, year: int, month: int, today) -> dict:
+    """指定した月の今日までで、(既存+今回の取込を合わせても)全体kWhが入っていない日。"""
+    from datetime import date, timedelta
+    first = date(year, month, 1)
+    nxt = date(year + (month == 12), month % 12 + 1, 1)
+    last = min(today, nxt - timedelta(days=1))
+    have = {(r.site, r.date.date()) for r in daily.itertuples() if pd.notna(r.total_kwh)}
+    have |= {(r.site, r.date.date()) for r in plan.itertuples()}
+    res = {}
+    for s in site_names:
+        miss, d = [], first
+        while d <= last:
+            if (s, d) not in have:
+                miss.append(d)
+            d += timedelta(days=1)
+        if miss:
+            res[s] = date_ranges(miss)
+    return res
